@@ -1,24 +1,35 @@
 import httpx
 import json
 import datetime
+import os
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
+from dotenv import load_dotenv
+
+# Import custom logger
+from logger import logger, configure_logging
+
+# Load .env file variables
+load_dotenv()
+
+# Configure logging
+configure_logging(log_level="INFO", log_to_console=True)
 
 app = FastAPI()
 
 # URL tempat vLLM berjalan (default vLLM)
-import os
-from dotenv import load_dotenv
-
-load_dotenv() # Load .env file variables
-
 VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8005")
 PORT = int(os.getenv("PORT", 8004))
+
+# --- Health Check Endpoint ---
+@app.get("/health")
+async def health_check():
+    return {"status": "ok", "timestamp": datetime.datetime.now().isoformat()}
 
 # --- 1. Endpoint untuk List Models (GET) ---
 @app.get("/v1/models")
 async def list_models():
-    print(f"\n[LOG] Client meminta list models (/v1/models)... Redirecting to {VLLM_URL}")
+    logger.info(f"Client meminta list models (/v1/models)... Redirecting to {VLLM_URL}")
     
     async with httpx.AsyncClient() as client:
         try:
@@ -28,6 +39,7 @@ async def list_models():
             # Kembalikan jawaban persis seperti vLLM
             return JSONResponse(content=resp.json(), status_code=resp.status_code)
         except Exception as e:
+            logger.error(f"Error listing models: {e}")
             return JSONResponse(content={"error": str(e)}, status_code=500)
 
 # --- 2. Endpoint untuk Chat Completions (POST) ---
@@ -38,8 +50,7 @@ async def chat_completions(request: Request):
     
     # --- LOGGING ---
     model_name = body.get("model", "unknown")
-    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_msg = f"[{timestamp}] [REQ] Model: {model_name}"
+    log_msg = f"[REQ] Model: {model_name}"
     
     if "messages" in body and len(body['messages']) > 0:
         last_msg = body['messages'][-1]
@@ -59,7 +70,7 @@ async def chat_completions(request: Request):
     else:
         log_msg += f" | Raw: {str(body)[:50]}..."
 
-    print(log_msg)
+    logger.info(log_msg)
     # ---------------
 
     # Cek apakah client meminta streaming
@@ -72,8 +83,7 @@ async def chat_completions(request: Request):
         outbound_headers["Authorization"] = request.headers["authorization"]
 
     target_url = f"{VLLM_URL}/v1/chat/completions"
-    # print(f"[DEBUG] Forwarding to: {target_url}")
-
+    
     async with httpx.AsyncClient(timeout=None) as client:
         try:
             if is_stream:
@@ -83,6 +93,7 @@ async def chat_completions(request: Request):
                     collected_content = []
                     async with httpx.AsyncClient(timeout=None) as stream_client:
                         try:
+                            # Use stream context manager properly
                             async with stream_client.stream(
                                 "POST",
                                 target_url,
@@ -91,11 +102,9 @@ async def chat_completions(request: Request):
                             ) as response:
                                 
                                 if response.status_code != 200:
-                                    # ... (Error handling existing code) ...
                                     err_content = await response.aread()
                                     err_text = err_content.decode('utf-8')
-                                    print(f"[ERROR] vLLM responded with {response.status_code}")
-                                    print(f"[ERROR] Details: {err_text}")
+                                    logger.error(f"vLLM responded with {response.status_code} - {err_text}")
                                     yield err_content
                                     return
 
@@ -122,18 +131,17 @@ async def chat_completions(request: Request):
                             full_reply = "".join(collected_content)
                             cleaned_reply = full_reply.replace('\n', ' ')
                             display_reply = (cleaned_reply[:100] + '...') if len(cleaned_reply) > 100 else cleaned_reply
-                            resp_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            print(f"[{resp_timestamp}] [RESP] {display_reply}")
+                            logger.info(f"[RESP] {display_reply}")
 
                         except Exception as e:
-                            print(f"[ERROR] Stream Exception: {e}")
+                            logger.error(f"Stream Exception: {e}")
                             yield f'{{"error": "{str(e)}"}}'.encode()
                             
                 return StreamingResponse(proxy_generator(), media_type="text/event-stream")
             
             else:
                 # --- HANDLING NON-STREAMING (NORMAL) ---
-                print("[LOG] Mode: Non-Streaming")
+                logger.info("Mode: Non-Streaming")
                 response = await client.post(
                     target_url,
                     json=body,
@@ -141,7 +149,7 @@ async def chat_completions(request: Request):
                 )
                 
                 if response.status_code != 200:
-                    print(f"[ERROR] vLLM Error: {response.status_code} - {response.text}")
+                    logger.error(f"vLLM Error: {response.status_code} - {response.text}")
                     return JSONResponse(content={"error": f"vLLM Error {response.status_code}", "details": response.text}, status_code=response.status_code)
 
                 # Log response
@@ -159,16 +167,15 @@ async def chat_completions(request: Request):
                     
                 display_resp = (cleaned_resp[:100] + '...') if len(cleaned_resp) > 100 else cleaned_resp
                 
-                resp_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[{resp_timestamp}] [RESP] {display_resp}") # Log response
+                logger.info(f"[RESP] {display_resp}") 
                 
                 return JSONResponse(content=resp_json, status_code=response.status_code)
                 
         except Exception as e:
-            print(f"[ERROR] Exception: {e}")
+            logger.error(f"Exception: {e}")
             return JSONResponse(content={"error": str(e)}, status_code=500)
 
 if __name__ == "__main__":
     import uvicorn
-    print(f"Wrapper berjalan di port {PORT} -> Forwarding ke {VLLM_URL}")
+    logger.info(f"Wrapper berjalan di port {PORT} -> Forwarding ke {VLLM_URL}")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
